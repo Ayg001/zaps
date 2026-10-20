@@ -21,6 +21,10 @@ jest.mock("expo-router", () => ({
   },
 }));
 
+jest.mock("@stellar/stellar-sdk", () => ({
+  FederationServer: undefined,
+}));
+
 jest.mock("../src/services/stellarWallet", () => ({
   getLocalKeypair: jest.fn(() => null),
   checkFreighter: jest.fn(),
