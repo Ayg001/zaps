@@ -835,9 +835,19 @@ function TransferScreen() {
 
   const handleKeypadPress = (value: string) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    setAmount((prev: string) =>
-      value === "backspace" ? prev.slice(0, -1) : prev + value
-    );
+    setAmount((prev: string) => {
+      if (value === "backspace") return prev.slice(0, -1);
+
+      if (value === ".") {
+        if (prev.includes(".")) return prev;
+        return prev ? `${prev}.` : "0.";
+      }
+
+      const decimalIndex = prev.indexOf(".");
+      if (decimalIndex >= 0 && prev.length - decimalIndex > 7) return prev;
+      if (prev === "0") return value;
+      return `${prev}${value}`;
+    });
   };
 
   const renderStep0 = () => (
@@ -1128,9 +1138,14 @@ function TransferScreen() {
         <TouchableOpacity
           activeOpacity={1}
           style={[styles.transferInput, styles.amountDisplayContainer]}
+          testID="transfer-amount-display"
         >
-          <Text style={styles.nairaSymbol}>₦</Text>
-          <Text style={styles.amountText}>{amount || "0"}</Text>
+          <Text style={styles.nairaSymbol} testID="transfer-amount-currency">
+            ₦
+          </Text>
+          <Text style={styles.amountText} testID="transfer-amount-value">
+            {amount || "0"}
+          </Text>
         </TouchableOpacity>
 
         {/* Custom Numeric Keypad */}
@@ -1141,6 +1156,7 @@ function TransferScreen() {
                 key={num}
                 style={styles.keypadButton}
                 onPress={() => handleKeypadPress(num)}
+                testID={`keypad-key-${num}`}
               >
                 <Text style={styles.keypadButtonText}>{num}</Text>
               </TouchableOpacity>
@@ -1172,18 +1188,21 @@ function TransferScreen() {
             <TouchableOpacity
               style={styles.keypadButton}
               onPress={() => handleKeypadPress(".")}
+              testID="keypad-decimal"
             >
               <Text style={styles.keypadButtonText}>.</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.keypadButton}
               onPress={() => handleKeypadPress("0")}
+              testID="keypad-key-0"
             >
               <Text style={styles.keypadButtonText}>0</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.keypadButton}
               onPress={() => handleKeypadPress("backspace")}
+              testID="keypad-backspace"
             >
               <Text style={styles.keypadButtonText}>⌫</Text>
             </TouchableOpacity>
