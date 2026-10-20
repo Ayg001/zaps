@@ -21,6 +21,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter, Stack } from "expo-router";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import { COLORS } from "../src/constants/colors";
 import { Button } from "../src/components/Button";
 import { Input } from "../src/components/Input";
@@ -589,9 +590,19 @@ function TransferScreen() {
   }, []);
 
   const token = TOKENS.find((t) => t.id === selectedToken) || TOKENS[0];
+  const paymentDestination =
+    transferType === "ZAPS"
+      ? selectedUser?.address ??
+        (recipient.trim().startsWith("G") ? recipient.trim() : "")
+      : recipient.trim();
 
   useEffect(() => {
-    if (step !== 3 || !walletState?.isConnected || !recipient || !amount) {
+    if (
+      step !== 3 ||
+      !walletState?.isConnected ||
+      !paymentDestination ||
+      !amount
+    ) {
       setTransactionFeeEstimate(null);
       return;
     }
@@ -604,7 +615,7 @@ function TransferScreen() {
           token.symbol !== "XLM" ? STELLAR_ASSET_ISSUERS[token.symbol] : undefined;
         const txXdr = await buildPaymentEnvelope(
           walletState.publicKey,
-          recipient,
+          paymentDestination,
           amount,
           token.symbol,
           assetIssuer,
@@ -624,7 +635,7 @@ function TransferScreen() {
     return () => {
       isMounted = false;
     };
-  }, [step, walletState, recipient, amount, token.symbol, description]);
+  }, [step, walletState, paymentDestination, amount, token.symbol, description]);
 
   useEffect(() => {
     (async () => {
@@ -682,6 +693,14 @@ function TransferScreen() {
   );
 
   const processConfirmedTransfer = async () => {
+    if (!paymentDestination) {
+      Alert.alert(
+        "Recipient Not Resolved",
+        "Select a Zaps recipient or enter a valid Stellar public key before sending."
+      );
+      return;
+    }
+
     // Biometric Verification Overlay
     // Gate the payment submission behind biometric / passcode authentication.
     // The transfer is blocked unless the user successfully authenticates.
@@ -708,7 +727,7 @@ function TransferScreen() {
           ? STELLAR_ASSET_ISSUERS[token.symbol]
           : undefined;
       const result = await submitPayment(
-        recipient,
+        paymentDestination,
         amount,
         walletState!.source!,
         walletState!.publicKey,
