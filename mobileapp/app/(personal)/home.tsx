@@ -77,7 +77,7 @@ interface FeedItem {
 interface YieldSnapshot {
   apy: string;
   totalYieldEarned: string;
-  explanation: string;
+  explanation?: string;
 }
 
 interface Comment {
@@ -230,6 +230,24 @@ export default function HomeScreen() {
       totalYieldEarned: formattedYield,
       explanation: data.explanation,
     };
+  };
+
+  const withTimeout = async <T,>(
+    promise: Promise<T>,
+    timeoutMs: number
+  ): Promise<T> => {
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<T>((_, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error("Request timed out. Please try again.")),
+        timeoutMs
+      );
+    });
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+    }
   };
 
   const loadYieldData = useCallback(async () => {
@@ -458,17 +476,21 @@ export default function HomeScreen() {
 
   const onPullRefresh = useCallback(async () => {
     setRefreshing(true);
+    const yieldRefresh = loadYieldData();
     try {
-      const fresh = await fetchFeed();
-      if (fresh && fresh.length > 0) {
-        setFeed(fresh);
-        await AsyncStorage.setItem(FEED_CACHE_KEY, JSON.stringify(fresh));
+      try {
+        const fresh = await fetchFeed();
+        if (fresh && fresh.length > 0) {
+          setFeed(fresh);
+          await AsyncStorage.setItem(FEED_CACHE_KEY, JSON.stringify(fresh));
+        }
+      } catch {
+        // keep current feed
       }
-    } catch {
-      // keep current feed
+    } finally {
+      await yieldRefresh;
+      setRefreshing(false);
     }
-    await loadYieldData();
-    setRefreshing(false);
   }, [loadYieldData]);
 
   const handleLike = async (id: string) => {
@@ -823,6 +845,7 @@ export default function HomeScreen() {
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
+        testID="home-scroll-view"
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -919,56 +942,57 @@ export default function HomeScreen() {
                 </Text>
               )}
             </View>
-
-            {/* Earning Balance Section */}
-            <TouchableOpacity
-              style={[styles.balancePanel, styles.earningPanel]}
-              activeOpacity={0.8}
-              onPress={openEarningsModal}
-              accessibilityRole="button"
-              accessibilityLabel="Earning Balance"
-              testID="earning-balance-section"
-            >
-              <View style={styles.earningBalanceHeader}>
-                <View style={styles.earningDot} />
-                <Text style={styles.earningRowLabel}>Earning</Text>
-              </View>
-              {yieldStatus === "loading" ? (
-                <SkeletonBlock
-                  testID="earning-balance-skeleton"
-                  style={[styles.balanceAmountSkeleton, styles.earningSkeleton]}
-                />
-              ) : (
-                <Text
-                  style={styles.earningPanelAmount}
-                  numberOfLines={1}
-                  adjustsFontSizeToFit
-                  testID="earning-balance-amount"
-                >
-                  {yieldStatus === "error"
-                    ? BALANCE_UNAVAILABLE
-                    : displayBalance(totalYieldEarnedDisplay)}
-                </Text>
-              )}
-            </TouchableOpacity>
+            <Text style={styles.balanceAmount}>
+              {displayBalance(availableBalanceDisplay)}
+            </Text>
           </View>
 
-          {yieldStatus === "error" && (
-            <View style={styles.balanceErrorRow} testID="balance-error">
-              <Text style={styles.balanceErrorText}>{yieldError}</Text>
-              <TouchableOpacity
-                style={styles.retryChip}
-                onPress={handleYieldRetry}
-                activeOpacity={0.85}
-                accessibilityRole="button"
-                accessibilityLabel="Retry loading balances"
-                testID="balance-retry"
-              >
-                <Ionicons name="refresh" size={12} color={COLORS.primary} />
-                <Text style={styles.retryChipText}>Retry</Text>
-              </TouchableOpacity>
+          {/* Earning Balance Section */}
+          <TouchableOpacity
+            style={styles.earningBalanceSection}
+            activeOpacity={0.8}
+            onPress={openEarningsModal}
+            accessibilityRole="button"
+            accessibilityLabel="Earning Balance"
+            testID="earning-balance-section"
+          >
+            {autoYieldEnabled && yieldStatus === "success" && (
+              <Animated.View
+                pointerEvents="none"
+                style={[
+                  styles.earningBalanceGlow,
+                  {
+                    opacity: earningGlowAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [0.2, 0.75],
+                    }),
+                    transform: [
+                      {
+                        scale: earningGlowAnim.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: [1, 1.025],
+                        }),
+                      },
+                    ],
+                  },
+                ]}
+                testID="earning-balance-glow"
+              />
+            )}
+            <View style={styles.earningBalanceHeader}>
+              <Animated.View
+                style={[
+                  styles.earningDot,
+                  { transform: [{ scale: earningPulseAnim }] },
+                ]}
+                testID="earning-balance-pulse"
+              />
+              <Text style={styles.earningRowLabel}>Earning Balance</Text>
             </View>
-          )}
+            <Text style={styles.earningBalanceAmount}>
+              {displayBalance(totalYieldEarnedDisplay)}
+            </Text>
+          </TouchableOpacity>
 
           {/* Pay / Request trigger button (#886) */}
           <TouchableOpacity
@@ -2050,34 +2074,25 @@ const styles = StyleSheet.create({
     fontFamily: "Outfit_700Bold",
     color: COLORS.secondary,
   },
-  earningPanelAmount: {
-    fontSize: 24,
-    fontFamily: "Outfit_700Bold",
-    color: "#166534",
+  earningBalanceSection: {
+    position: "relative",
+    backgroundColor: "#F2F9F0",
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: "#E8F5E9",
   },
-  balanceAmountSkeleton: {
-    height: 28,
-    width: "80%",
-    marginTop: 4,
-  },
-  availableSkeleton: {
-    backgroundColor: "rgba(255, 255, 255, 0.16)",
-  },
-  earningSkeleton: {
-    backgroundColor: "#C6E9D1",
-  },
-  balanceErrorRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 10,
-    marginBottom: 16,
-  },
-  balanceErrorText: {
-    flex: 1,
-    fontSize: 12,
-    fontFamily: "Outfit_400Regular",
-    color: "#92400E",
+  earningBalanceGlow: {
+    ...StyleSheet.absoluteFillObject,
+    borderRadius: 18,
+    borderWidth: 2,
+    borderColor: "#34D399",
+    shadowColor: "#34D399",
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.55,
+    shadowRadius: 12,
+    elevation: 5,
   },
   earningBalanceHeader: {
     flexDirection: "row",
@@ -2411,6 +2426,11 @@ const styles = StyleSheet.create({
     fontFamily: "Outfit_700Bold",
     color: COLORS.white,
     marginBottom: 8,
+  },
+  earningHint: {
+    fontSize: 12,
+    fontFamily: "Outfit_400Regular",
+    color: "#9FD9B5",
   },
   earningStatusRow: {
     flexDirection: "row",
