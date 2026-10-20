@@ -1,10 +1,23 @@
 jest.mock("@react-native-async-storage/async-storage", () =>
   require("@react-native-async-storage/async-storage/jest/async-storage-mock")
 );
+jest.mock("expo-haptics", () => ({
+  notificationAsync: jest.fn(() => Promise.resolve()),
+  NotificationFeedbackType: { Success: "success" },
+  impactAsync: jest.fn(() => Promise.resolve()),
+  ImpactFeedbackStyle: { Light: "light" },
+}));
+jest.mock("@expo/vector-icons", () => ({
+  Ionicons: () => null,
+}));
 
 import React from "react";
 import { render, waitFor, act, fireEvent } from "@testing-library/react-native";
-import TransferScreenWithBoundary from "../app/transfer";
+import TransferScreenWithBoundary, {
+  SuccessAnimation,
+} from "../app/transfer";
+import { fetchMatchedContacts } from "../src/services/contacts";
+import * as Haptics from "expo-haptics";
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
 
@@ -117,6 +130,47 @@ describe("TransferScreen – Registry Warning Banners", () => {
     mockFetch.mockReset();
   });
 
+  describe("Transfer success receipt", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("highlights the recipient username and completed transaction status", () => {
+      const renderResult = render(
+        <SuccessAnimation
+          amount="25"
+          recipient="receiptuser"
+          selectedUser={{
+            username: "receiptuser",
+            address: "GABCDEF1234567890XYZ",
+            avatar_url: null,
+            isVerified: true,
+          }}
+          description="Thanks!"
+        />
+      );
+
+      expect(renderResult.getByText("@receiptuser")).toBeTruthy();
+      expect(renderResult.getByTestId("success-transaction-status")).toBeTruthy();
+      expect(renderResult.getByText("Completed")).toBeTruthy();
+    });
+
+    it("triggers success haptics when the receipt is shown", () => {
+      render(
+        <SuccessAnimation
+          amount="25"
+          recipient="receiptuser"
+          selectedUser={null}
+          description=""
+        />
+      );
+
+      expect(Haptics.notificationAsync).toHaveBeenCalledWith(
+        Haptics.NotificationFeedbackType.Success
+      );
+    });
+  });
+
   // ── 1. "Not registered" warning ────────────────────────────────────────────
 
   it("shows 'not registered' warning when resolve returns 404", async () => {
@@ -178,6 +232,48 @@ describe("TransferScreen – Registry Warning Banners", () => {
     // instead of getByText (which returns the inner <Text> without accessibilityState).
     const continueBtn = renderResult.getByLabelText("Review");
     expect(continueBtn.props.accessibilityState?.disabled).toBe(true);
+  });
+
+  it("shows a warning and disables continue when the API rejects a username", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [],
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        json: async () => ({ error: "invalid username" }),
+      });
+
+    const renderResult = render(<TransferScreenWithBoundary />);
+    await advanceToStep1(renderResult);
+    await typeRecipient(renderResult, "Bad_Name");
+
+    await waitFor(() => {
+      expect(renderResult.getByTestId("warning-invalid-username")).toBeTruthy();
+    });
+    expect(
+      renderResult.getByLabelText("Review").props.accessibilityState?.disabled
+    ).toBe(true);
+  });
+
+  it("warns and disables continue for usernames shorter than three characters", async () => {
+    const renderResult = render(<TransferScreenWithBoundary />);
+    await advanceToStep1(renderResult);
+
+    await act(async () => {
+      fireEvent.changeText(
+        renderResult.getByPlaceholderText(/Recipient ZAPS ID/i),
+        "ab"
+      );
+    });
+
+    expect(renderResult.getByTestId("warning-invalid-username")).toBeTruthy();
+    expect(
+      renderResult.getByLabelText("Review").props.accessibilityState?.disabled
+    ).toBe(true);
   });
 
   // ── 2. "Blacklisted" warning ───────────────────────────────────────────────
@@ -335,6 +431,12 @@ describe("TransferScreen – Registry Warning Banners", () => {
 
     // The checking banner should be visible while the request is pending
     expect(renderResult.getByTestId("warning-checking")).toBeTruthy();
+    await act(async () => {
+      fireEvent.press(renderResult.getByText("1"));
+    });
+    expect(
+      renderResult.getByLabelText("Review").props.accessibilityState?.disabled
+    ).toBe(true);
 
     // Resolve the pending request
     await act(async () => {
@@ -351,6 +453,61 @@ describe("TransferScreen – Registry Warning Banners", () => {
       expect(renderResult.getByTestId("warning-not-registered")).toBeTruthy();
     });
   });
+
+  it("ignores a registry response for an outdated recipient", async () => {
+    let resolveOldRequest!: (value: unknown) => void;
+    const oldRequest = new Promise<unknown>((resolve) => {
+      resolveOldRequest = resolve;
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [],
+      })
+      .mockReturnValueOnce(oldRequest)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          username: "validuser",
+          address: "GABCDEF1234567890XYZ",
+        }),
+      });
+
+    const renderResult = render(<TransferScreenWithBoundary />);
+    await advanceToStep1(renderResult);
+    const input = renderResult.getByPlaceholderText(/Recipient ZAPS ID/i);
+
+    await act(async () => {
+      fireEvent.changeText(input, "olduser");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    });
+    await act(async () => {
+      fireEvent.changeText(input, "validuser");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    });
+
+    await waitFor(() => {
+      expect(renderResult.getByTestId("warning-registered")).toBeTruthy();
+    });
+    await act(async () => {
+      resolveOldRequest({
+        ok: false,
+        status: 404,
+        json: async () => ({ error: "username not found" }),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(renderResult.getByTestId("warning-registered")).toBeTruthy();
+    expect(renderResult.queryByTestId("warning-not-registered")).toBeNull();
+  }, 15000);
 
   it("does not show any warning for external wallet mode", async () => {
     // Type a recipient — no warning should appear for external wallets
@@ -447,6 +604,103 @@ describe("TransferScreen – Registry Warning Banners", () => {
     expect(input.props.value).toBe("tolu.zaps");
   });
 
+  it("checks blacklist status after selecting a search result", async () => {
+    const selectedUser = {
+      username: "flaggeduser",
+      address: "GABCDEF1234567890XYZ",
+    };
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [selectedUser],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => selectedUser,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          username: "flaggeduser",
+          address: "GABCDEF1234567890XYZ",
+          is_blacklisted: true,
+        }),
+      });
+
+    const renderResult = render(<TransferScreenWithBoundary />);
+    await advanceToStep1(renderResult);
+    const input = renderResult.getByPlaceholderText(/Recipient ZAPS ID/i);
+    await act(async () => {
+      fireEvent.changeText(input, "flagged");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    });
+    await waitFor(() => {
+      expect(renderResult.getByTestId("search-result-flaggeduser")).toBeTruthy();
+    });
+    await act(async () => {
+      fireEvent.press(renderResult.getByTestId("search-result-flaggeduser"));
+      fireEvent.press(renderResult.getByText("1"));
+    });
+
+    await waitFor(() => {
+      expect(renderResult.getByTestId("warning-blacklisted")).toBeTruthy();
+    });
+    expect(
+      renderResult.getByLabelText("Review").props.accessibilityState?.disabled
+    ).toBe(true);
+  });
+
+  it("checks blacklist status after selecting a matched contact", async () => {
+    jest.mocked(fetchMatchedContacts).mockResolvedValueOnce([
+      {
+        contactName: "Flagged User",
+        username: "flaggeduser",
+        address: "GABCDEF1234567890XYZ",
+        phoneNumber: "123456789",
+      },
+    ]);
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => [],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          username: "flaggeduser",
+          address: "GABCDEF1234567890XYZ",
+          is_blacklisted: true,
+        }),
+      });
+
+    const renderResult = render(<TransferScreenWithBoundary />);
+    await advanceToStep1(renderResult);
+    await waitFor(() => {
+      expect(renderResult.getByTestId("contact-item-flaggeduser")).toBeTruthy();
+    });
+    await act(async () => {
+      fireEvent.press(renderResult.getByTestId("contact-item-flaggeduser"));
+      fireEvent.press(renderResult.getByText("1"));
+    });
+
+    await waitFor(() => {
+      expect(renderResult.getByTestId("warning-blacklisted")).toBeTruthy();
+    });
+    expect(
+      renderResult.getByLabelText("Review").props.accessibilityState?.disabled
+    ).toBe(true);
+  });
+
   // ── 6. Issue #888: Note / Description input field ─────────────────────────
 
   it("renders note input field with 100 character maxLength", async () => {
@@ -509,6 +763,11 @@ describe("TransferScreen – Registry Warning Banners", () => {
     await typeRecipient(renderResult, "chidi.zaps");
 
     // Advance to Step 2 (Summary)
+    await waitFor(() => {
+      expect(
+        renderResult.getByLabelText("Review").props.accessibilityState?.disabled
+      ).toBe(false);
+    });
     const reviewBtn = renderResult.getByLabelText("Review");
     await act(async () => {
       fireEvent.press(reviewBtn);

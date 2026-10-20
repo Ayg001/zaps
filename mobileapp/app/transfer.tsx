@@ -205,7 +205,19 @@ const API_BASE =
   (typeof process !== "undefined" && process.env?.EXPO_PUBLIC_API_URL) ||
   "http://localhost:8080";
 
-const SuccessAnimation = ({ amount, recipient, selectedUser, description }: any) => {
+interface SuccessAnimationProps {
+  amount: string;
+  recipient: string;
+  selectedUser: ZapsUser | null;
+  description: string;
+}
+
+export const SuccessAnimation = ({
+  amount,
+  recipient,
+  selectedUser,
+  description,
+}: SuccessAnimationProps) => {
   const scaleAnim = useRef(new Animated.Value(0)).current;
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideRecipient = useRef(new Animated.Value(60)).current;
@@ -226,7 +238,7 @@ const SuccessAnimation = ({ amount, recipient, selectedUser, description }: any)
         duration: 300,
         useNativeDriver: true,
       }),
-      Animated.parallel([
+      Animated.stagger(120, [
         Animated.timing(slideRecipient, {
           toValue: 0,
           duration: 400,
@@ -239,7 +251,7 @@ const SuccessAnimation = ({ amount, recipient, selectedUser, description }: any)
         }),
       ]),
     ]).start();
-  }, []);
+  }, [fadeAnim, scaleAnim, slideDetails, slideRecipient]);
 
   const displayUser = selectedUser || {
     username: recipient,
@@ -265,7 +277,13 @@ const SuccessAnimation = ({ amount, recipient, selectedUser, description }: any)
         </View>
       </Animated.View>
 
-      <Animated.View style={[styles.detailsCard, { transform: [{ translateY: slideRecipient }], opacity: fadeAnim }]}>
+      <Animated.View
+        style={[
+          styles.detailsCard,
+          { transform: [{ translateY: slideRecipient }], opacity: fadeAnim },
+        ]}
+        testID="success-recipient-card"
+      >
         <View style={styles.detailsRow}>
           <View style={styles.detailsAvatar}>
             <Text style={styles.detailsAvatarText}>
@@ -274,7 +292,12 @@ const SuccessAnimation = ({ amount, recipient, selectedUser, description }: any)
           </View>
           <View style={styles.detailsInfo}>
             <Text style={styles.detailsLabel}>Recipient</Text>
-            <Text style={styles.detailsValue}>{displayUser.username}</Text>
+            <Text
+              style={[styles.detailsValue, styles.successUsername]}
+              testID="success-recipient-username"
+            >
+              @{displayUser.username}
+            </Text>
           </View>
           {displayUser.isVerified && (
             <Ionicons name="checkmark-circle" size={20} color="#1A4B4A" />
@@ -282,14 +305,20 @@ const SuccessAnimation = ({ amount, recipient, selectedUser, description }: any)
         </View>
       </Animated.View>
 
-      <Animated.View style={[styles.detailsCard, { transform: [{ translateY: slideDetails }], opacity: fadeAnim }]}>
+      <Animated.View
+        style={[
+          styles.detailsCard,
+          { transform: [{ translateY: slideDetails }], opacity: fadeAnim },
+        ]}
+        testID="success-transaction-card"
+      >
         <View style={styles.detailsRow}>
           <Ionicons name="information-circle-outline" size={20} color="#777" />
           <View style={styles.detailsInfo}>
             <Text style={styles.detailsLabel}>Note</Text>
             <Text style={styles.detailsValue}>{description || "Sent money"}</Text>
           </View>
-          <View style={styles.statusBadge}>
+          <View style={styles.statusBadge} testID="success-transaction-status">
             <Text style={styles.statusBadgeText}>Completed</Text>
           </View>
         </View>
@@ -330,14 +359,23 @@ function TransferScreen() {
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Registry check state (not registered / blacklisted warnings)
-  type UsernameStatus = "idle" | "checking" | "registered" | "not_registered" | "blacklisted";
+  type UsernameStatus =
+    | "idle"
+    | "checking"
+    | "registered"
+    | "not_registered"
+    | "blacklisted"
+    | "invalid"
+    | "error";
   const [usernameStatus, setUsernameStatus] = useState<UsernameStatus>("idle");
+  const usernameCheckId = useRef(0);
 
   // #686 — Stellar Federation resolution state
   type FederationStatus = "idle" | "resolving" | "resolved" | "error";
   const [federationStatus, setFederationStatus] = useState<FederationStatus>("idle");
   const [federationError, setFederationError] = useState<string | null>(null);
   const federationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const federationResolvedRecipient = useRef<string | null>(null);
 
   // Batch upload state
   const [batchFile, setBatchFile] = useState<DocumentPicker.DocumentPickerResult | null>(null);
@@ -387,23 +425,32 @@ function TransferScreen() {
    *   - "checking"       → while the request is in flight
    *   - "idle"           → when no check is needed
    */
-  const checkUsernameRegistry = useCallback(async (username: string) => {
-    if (!username || username.length < 2) {
-      setUsernameStatus("idle");
+  const checkUsernameRegistry = useCallback(async (
+    username: string,
+    checkId = ++usernameCheckId.current
+  ) => {
+    const normalizedUsername = username.trim().replace(/^@/, "");
+    if (normalizedUsername.length < 3) {
+      if (checkId === usernameCheckId.current) {
+        setUsernameStatus(normalizedUsername ? "invalid" : "idle");
+      }
       return;
     }
-    setUsernameStatus("checking");
     try {
       const res = await fetch(
-        `${API_BASE}/api/users/resolve/${encodeURIComponent(username)}`
+        `${API_BASE}/api/users/resolve/${encodeURIComponent(normalizedUsername)}`
       );
+      if (checkId !== usernameCheckId.current) return;
       if (res.status === 404) {
         setUsernameStatus("not_registered");
         return;
       }
+      if (res.status === 400) {
+        setUsernameStatus("invalid");
+        return;
+      }
       if (!res.ok) {
-        // Non-404 error — treat as unknown, keep current status
-        setUsernameStatus("idle");
+        setUsernameStatus("error");
         return;
       }
       const body: {
@@ -415,6 +462,11 @@ function TransferScreen() {
         avatar_url?: string;
         is_verified?: boolean;
       } = await res.json();
+      if (checkId !== usernameCheckId.current) return;
+      if (!body.username || !body.address) {
+        setUsernameStatus("error");
+        return;
+      }
       if (body.is_blacklisted) {
         setUsernameStatus("blacklisted");
       } else {
@@ -429,8 +481,9 @@ function TransferScreen() {
         }));
       }
     } catch {
-      // Network error — don't block the user from proceeding
-      setUsernameStatus("idle");
+      if (checkId === usernameCheckId.current) {
+        setUsernameStatus("error");
+      }
     }
   }, []);
 
@@ -482,6 +535,7 @@ function TransferScreen() {
       }
 
       setRecipient(publicKey);
+      federationResolvedRecipient.current = publicKey;
       setFederationStatus("resolved");
       setUsernameStatus("registered");
     } catch (err) {
@@ -496,23 +550,36 @@ function TransferScreen() {
 
   // Debounce search while user types (ZAPS mode only) + registry check + federation
   useEffect(() => {
-    if (transferType !== "ZAPS") return;
+    const checkId = ++usernameCheckId.current;
+    if (transferType !== "ZAPS") {
+      setUsernameStatus("idle");
+      return () => {
+        usernameCheckId.current += 1;
+      };
+    }
     if (searchTimer.current) clearTimeout(searchTimer.current);
     if (federationTimer.current) clearTimeout(federationTimer.current);
 
-    // Reset registry status when the user is actively typing
-    if (recipient.length >= 2) {
-      setUsernameStatus("idle");
-    }
+    const normalizedUsername = recipient.trim().replace(/^@/, "");
+    const isResolvedFederationRecipient =
+      recipient === federationResolvedRecipient.current;
+    const isFederationAddress = isFederatedAddress(recipient);
+    setUsernameStatus(
+      isFederationAddress || isResolvedFederationRecipient
+        ? "idle"
+        : normalizedUsername.length >= 3
+          ? "checking"
+          : normalizedUsername
+            ? "invalid"
+            : "idle"
+    );
 
     // #686 — Trigger federation resolution for federated addresses
-    if (isFederatedAddress(recipient)) {
-      setFederationStatus("idle");
-      setFederationError(null);
+    if (isFederationAddress) {
       federationTimer.current = setTimeout(() => {
         resolveFederationAddress(recipient);
       }, 300);
-    } else {
+    } else if (!isResolvedFederationRecipient) {
       setFederationStatus("idle");
       setFederationError(null);
     }
@@ -520,29 +587,41 @@ function TransferScreen() {
     searchTimer.current = setTimeout(() => {
       searchUsers(recipient);
       // After search settles, check the exact username against the registry
-      if (recipient.length >= 3 && !isFederatedAddress(recipient)) {
-        checkUsernameRegistry(recipient);
-      } else {
-        setUsernameStatus("idle");
+      if (
+        normalizedUsername.length >= 3 &&
+        !isFederationAddress &&
+        !isResolvedFederationRecipient
+      ) {
+        void checkUsernameRegistry(recipient, checkId);
+      } else if (!isFederationAddress && !isResolvedFederationRecipient) {
+        setUsernameStatus(normalizedUsername ? "invalid" : "idle");
       }
     }, 300);
     return () => {
       if (searchTimer.current) clearTimeout(searchTimer.current);
       if (federationTimer.current) clearTimeout(federationTimer.current);
+      usernameCheckId.current += 1;
     };
   }, [recipient, transferType, searchUsers, checkUsernameRegistry, resolveFederationAddress]);
 
   const handleSelectUser = useCallback((user: ZapsUser) => {
+    federationResolvedRecipient.current = null;
+    usernameCheckId.current += 1;
     setRecipient(user.username);
     setSelectedUser(user);
     setSearchResults([]);
     setShowDropdown(false);
-    // User selected from search results → definitely registered
-    setUsernameStatus("registered");
-  }, []);
+    setUsernameStatus("checking");
+
+    if (recipient.trim().replace(/^@/, "") === user.username) {
+      void checkUsernameRegistry(user.username);
+    }
+  }, [checkUsernameRegistry, recipient]);
 
   // #699 — Select a matched contact as the recipient
   const handleSelectContact = useCallback((contact: MatchedContact) => {
+    federationResolvedRecipient.current = null;
+    usernameCheckId.current += 1;
     setRecipient(contact.username);
     setSelectedUser({
       username: contact.username,
@@ -554,8 +633,12 @@ function TransferScreen() {
     } as ZapsUser);
     setSearchResults([]);
     setShowDropdown(false);
-    setUsernameStatus("registered");
-  }, []);
+    setUsernameStatus("checking");
+
+    if (recipient.trim().replace(/^@/, "") === contact.username) {
+      void checkUsernameRegistry(contact.username);
+    }
+  }, [checkUsernameRegistry, recipient]);
 
   // #699 — Load matched contacts on first ZAPS-mode step (lazy load, once)
   const loadContacts = useCallback(async () => {
@@ -590,11 +673,10 @@ function TransferScreen() {
   }, []);
 
   const token = TOKENS.find((t) => t.id === selectedToken) || TOKENS[0];
-  const paymentDestination =
-    transferType === "ZAPS"
-      ? selectedUser?.address ??
-        (recipient.trim().startsWith("G") ? recipient.trim() : "")
-      : recipient.trim();
+  const recipientValidationPassed =
+    usernameStatus === "registered" ||
+    (federationStatus === "resolved" &&
+      recipient === federationResolvedRecipient.current);
 
   useEffect(() => {
     if (
@@ -758,6 +840,10 @@ function TransferScreen() {
   };
 
   const handleNext = async () => {
+    if (step === 1 && transferType === "ZAPS" && !recipientValidationPassed) {
+      return;
+    }
+
     if (step === 0 && transferType === "BATCH") {
       LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
       setStep(1);
@@ -902,6 +988,7 @@ function TransferScreen() {
               }
               value={recipient}
               onChangeText={(text: string) => {
+                federationResolvedRecipient.current = null;
                 setRecipient(text);
                 setSelectedUser(null);
                 // Reset registry warning when user edits the field
@@ -1008,7 +1095,7 @@ function TransferScreen() {
                     onPress={() => {
                       setRecipient(username);
                       setShowDropdown(false);
-                      // Check registry for recent-contact selection
+                      setUsernameStatus("checking");
                       checkUsernameRegistry(username);
                     }}
                     activeOpacity={0.75}
@@ -1085,7 +1172,7 @@ function TransferScreen() {
           )}
 
         {/* ── Registry status warning banners (ZAPS mode only) ──────── */}
-        {transferType === "ZAPS" && recipient.length >= 3 && (
+        {transferType === "ZAPS" && recipient.trim().length > 0 && (
           <>
             {usernameStatus === "checking" && (
               <View style={styles.warningBanner} testID="warning-checking">
@@ -1116,6 +1203,30 @@ function TransferScreen() {
                 <Ionicons name="shield-outline" size={20} color="#DC2626" />
                 <Text style={styles.warningBannerTextDanger}>
                   @{recipient} has been flagged and cannot receive payments.
+                </Text>
+              </View>
+            )}
+
+            {usernameStatus === "invalid" && (
+              <View
+                style={[styles.warningBanner, styles.warningBannerDanger]}
+                testID="warning-invalid-username"
+              >
+                <Ionicons name="alert-circle" size={20} color="#DC2626" />
+                <Text style={styles.warningBannerTextDanger}>
+                  Enter a valid username using 3–15 lowercase letters or numbers.
+                </Text>
+              </View>
+            )}
+
+            {usernameStatus === "error" && (
+              <View
+                style={[styles.warningBanner, styles.warningBannerDanger]}
+                testID="warning-username-check-failed"
+              >
+                <Ionicons name="alert-circle" size={20} color="#DC2626" />
+                <Text style={styles.warningBannerTextDanger}>
+                  Unable to verify this username. Check your connection and try again.
                 </Text>
               </View>
             )}
@@ -1769,9 +1880,7 @@ function TransferScreen() {
                   (!recipient ||
                     !amount ||
                     (transferType === "ZAPS" &&
-                      recipient.length >= 3 &&
-                      (usernameStatus === "not_registered" ||
-                        usernameStatus === "blacklisted")) ||
+                      !recipientValidationPassed) ||
                     (federationStatus === "resolving" ||
                       federationStatus === "error"))) ||
                 (step === 3 && submitting) ||
@@ -2347,6 +2456,10 @@ const styles = StyleSheet.create({
     fontFamily: "Outfit_600SemiBold",
     color: COLORS.black,
     marginTop: 2,
+  },
+  successUsername: {
+    fontSize: 17,
+    color: "#1A4B4A",
   },
   statusBadge: {
     backgroundColor: "#E8F5E9",

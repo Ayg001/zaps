@@ -49,6 +49,11 @@ import {
   fiatFromTokens,
 } from "../../src/utils/balanceDisplay";
 import {
+  YIELD_REQUEST_TIMEOUT_MS,
+  describeYieldError,
+  withTimeout,
+} from "../../src/utils/yieldRequest";
+import {
   markNotificationPromptDismissed,
   registerForPushNotificationsAsync,
   requestNotificationPermissionsAsync,
@@ -72,7 +77,7 @@ interface FeedItem {
 interface YieldSnapshot {
   apy: string;
   totalYieldEarned: string;
-  explanation: string;
+  explanation?: string;
 }
 
 interface Comment {
@@ -169,6 +174,7 @@ export default function HomeScreen() {
   const [notifRequesting, setNotifRequesting] = useState(false);
   const [balanceMasked, setBalanceMasked] = useState(true);
   const MASKED_BALANCE = "••••••";
+  const BALANCE_UNAVAILABLE = "--";
   const earningsSheetTranslateY = useRef(new Animated.Value(48)).current;
   const earningsBackdropOpacity = useRef(new Animated.Value(0)).current;
   const shimmerAnim = useRef(new Animated.Value(-1)).current;
@@ -195,7 +201,6 @@ export default function HomeScreen() {
 
   const FEED_CACHE_KEY = "feed_items_cache";
   const HOME_CURRENCY_PREF_KEY = "home_display_currency";
-  const YIELD_REQUEST_TIMEOUT_MS = 4500;
 
   const fetchYieldSnapshot = async (): Promise<YieldSnapshot> => {
     const data = await fetchYieldBalance();
@@ -231,13 +236,18 @@ export default function HomeScreen() {
     promise: Promise<T>,
     timeoutMs: number
   ): Promise<T> => {
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<T>((_, reject) => {
-      setTimeout(
+      timeoutId = setTimeout(
         () => reject(new Error("Request timed out. Please try again.")),
         timeoutMs
       );
     });
-    return Promise.race([promise, timeoutPromise]);
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+    }
   };
 
   const loadYieldData = useCallback(async () => {
@@ -254,11 +264,7 @@ export default function HomeScreen() {
       setYieldStatus("success");
     } catch (error) {
       if (requestId !== yieldRequestRef.current) return;
-      const message =
-        error instanceof Error
-          ? error.message
-          : "Unable to load yield details right now.";
-      setYieldError(message);
+      setYieldError(describeYieldError(error));
       setYieldStatus("error");
     }
   }, []);
@@ -470,17 +476,21 @@ export default function HomeScreen() {
 
   const onPullRefresh = useCallback(async () => {
     setRefreshing(true);
+    const yieldRefresh = loadYieldData();
     try {
-      const fresh = await fetchFeed();
-      if (fresh && fresh.length > 0) {
-        setFeed(fresh);
-        await AsyncStorage.setItem(FEED_CACHE_KEY, JSON.stringify(fresh));
+      try {
+        const fresh = await fetchFeed();
+        if (fresh && fresh.length > 0) {
+          setFeed(fresh);
+          await AsyncStorage.setItem(FEED_CACHE_KEY, JSON.stringify(fresh));
+        }
+      } catch {
+        // keep current feed
       }
-    } catch {
-      // keep current feed
+    } finally {
+      await yieldRefresh;
+      setRefreshing(false);
     }
-    await loadYieldData();
-    setRefreshing(false);
   }, [loadYieldData]);
 
   const handleLike = async (id: string) => {
@@ -650,6 +660,12 @@ export default function HomeScreen() {
     setAutoEarnSyncing(true);
     try {
       await updateAutoEarn(value);
+      if (value) {
+        // Idle funds start sweeping into yield — confirm with a light bump.
+        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(
+          () => undefined
+        );
+      }
     } catch {
       // Revert on failure
       setAutoYieldEnabled(previous);
@@ -778,8 +794,14 @@ export default function HomeScreen() {
     monthlyEarnings,
   ]);
 
-  const SkeletonBlock = ({ style }: { style?: StyleProp<ViewStyle> }) => (
-    <View style={[styles.skeletonBase, style]}>
+  const SkeletonBlock = ({
+    style,
+    testID,
+  }: {
+    style?: StyleProp<ViewStyle>;
+    testID?: string;
+  }) => (
+    <View style={[styles.skeletonBase, style]} testID={testID}>
       <Animated.View
         style={[
           styles.skeletonShimmer,
@@ -823,6 +845,7 @@ export default function HomeScreen() {
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
+        testID="home-scroll-view"
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -873,29 +896,54 @@ export default function HomeScreen() {
           </View>
         )}
 
-        {/* Balance Card */}
+        {/* Balance Card — available and earning balances, side by side */}
         <View style={styles.balanceCard}>
-          {/* Available Balance Section */}
-          <View style={styles.balanceSection}>
-            <View style={styles.balanceLabelRow}>
-              <Text style={styles.balanceLabel}>Available Balance</Text>
-              <TouchableOpacity
-                onPress={toggleBalanceMask}
-                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                accessibilityRole="button"
-                accessibilityLabel={
-                  balanceMasked ? "Show balance" : "Hide balance"
-                }
-              >
-                <Ionicons
-                  name={balanceMasked ? "eye-outline" : "eye-off-outline"}
-                  size={20}
-                  color="#777"
+          <View style={styles.balanceSplit}>
+            {/* Available Balance Section */}
+            <View
+              style={[styles.balancePanel, styles.availablePanel]}
+              testID="available-balance-section"
+            >
+              <View style={styles.balanceLabelRow}>
+                <Text style={styles.availableLabel}>Available</Text>
+                <TouchableOpacity
+                  onPress={toggleBalanceMask}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    balanceMasked ? "Show balance" : "Hide balance"
+                  }
+                >
+                  <Ionicons
+                    name={balanceMasked ? "eye-outline" : "eye-off-outline"}
+                    size={18}
+                    color="#A9D8CF"
+                  />
+                </TouchableOpacity>
+              </View>
+              {yieldStatus === "loading" ? (
+                <SkeletonBlock
+                  testID="available-balance-skeleton"
+                  style={[
+                    styles.balanceAmountSkeleton,
+                    styles.availableSkeleton,
+                  ]}
                 />
-              </TouchableOpacity>
+              ) : (
+                <Text
+                  style={styles.availableAmount}
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                  testID="available-balance-amount"
+                >
+                  {yieldStatus === "error"
+                    ? BALANCE_UNAVAILABLE
+                    : displayBalance(availableBalanceDisplay)}
+                </Text>
+              )}
             </View>
             <Text style={styles.balanceAmount}>
-              {displayBalance(availableBalance)}
+              {displayBalance(availableBalanceDisplay)}
             </Text>
           </View>
 
@@ -908,12 +956,41 @@ export default function HomeScreen() {
             accessibilityLabel="Earning Balance"
             testID="earning-balance-section"
           >
+            {autoYieldEnabled && yieldStatus === "success" && (
+              <Animated.View
+                pointerEvents="none"
+                style={[
+                  styles.earningBalanceGlow,
+                  {
+                    opacity: earningGlowAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [0.2, 0.75],
+                    }),
+                    transform: [
+                      {
+                        scale: earningGlowAnim.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: [1, 1.025],
+                        }),
+                      },
+                    ],
+                  },
+                ]}
+                testID="earning-balance-glow"
+              />
+            )}
             <View style={styles.earningBalanceHeader}>
-              <View style={styles.earningDot} />
+              <Animated.View
+                style={[
+                  styles.earningDot,
+                  { transform: [{ scale: earningPulseAnim }] },
+                ]}
+                testID="earning-balance-pulse"
+              />
               <Text style={styles.earningRowLabel}>Earning Balance</Text>
             </View>
             <Text style={styles.earningBalanceAmount}>
-              {displayBalance(totalYieldEarned)}
+              {displayBalance(totalYieldEarnedDisplay)}
             </Text>
           </TouchableOpacity>
 
@@ -1015,68 +1092,52 @@ export default function HomeScreen() {
             accessibilityLabel="Earning Balance Card"
             testID="earning-balance-card"
           >
-            <View style={styles.earningContent}>
-              <Text style={styles.earningLabel}>Earning Balance</Text>
-              {yieldStatus === "loading" ? (
-                <View>
-                  <SkeletonBlock style={styles.earningAmountSkeleton} />
-                  <SkeletonBlock style={styles.earningHintSkeleton} />
-                </View>
-              ) : yieldStatus === "error" ? (
-                <View>
-                  <Text style={styles.earningErrorText}>
-                    Unable to load yield
-                  </Text>
-                  <TouchableOpacity
-                    style={styles.retryChip}
-                    onPress={handleYieldRetry}
-                    activeOpacity={0.85}
-                  >
-                    <Ionicons
-                      name="refresh"
-                      size={12}
-                      color={COLORS.primary}
-                    />
-                    <Text style={styles.retryChipText}>Retry</Text>
-                  </TouchableOpacity>
-                </View>
-              ) : (
-                <View>
-                  <Text style={styles.earningAmount}>
-                    {totalYieldEarnedDisplay}
-                  </Text>
-                  <View
+            {yieldStatus === "loading" ? (
+              <View
+                style={styles.earningContent}
+                testID="earning-card-skeleton"
+              >
+                <SkeletonBlock style={styles.earningLabelSkeleton} />
+                <SkeletonBlock style={styles.earningAmountSkeleton} />
+                <SkeletonBlock style={styles.earningHintSkeleton} />
+              </View>
+            ) : yieldStatus === "error" ? (
+              <View style={styles.earningContent} testID="earning-card-error">
+                <Text style={styles.earningLabel}>Earning Balance</Text>
+                <Text style={styles.earningErrorText}>{yieldError}</Text>
+                <TouchableOpacity
+                  style={styles.retryChip}
+                  onPress={handleYieldRetry}
+                  activeOpacity={0.85}
+                  accessibilityRole="button"
+                  accessibilityLabel="Retry loading yield"
+                  testID="earning-card-retry"
+                >
+                  <Ionicons name="refresh" size={12} color={COLORS.primary} />
+                  <Text style={styles.retryChipText}>Retry</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <View style={styles.earningContent}>
+                <Text style={styles.earningLabel}>Earning Balance</Text>
+                <Text style={styles.earningAmount}>
+                  {totalYieldEarnedDisplay}
+                </Text>
+                <View style={styles.earningStatusRow}>
+                  <Animated.View
                     style={[
-                      styles.earningStatusRow,
-                      autoYieldEnabled
-                        ? styles.earningStatusActive
-                        : styles.earningStatusInactive,
+                      styles.earningStatusDot,
+                      { transform: [{ scale: earningPulseAnim }] },
                     ]}
-                  >
-                    <Animated.View
-                      style={[
-                        styles.earningStatusDot,
-                        !autoYieldEnabled && styles.earningStatusDotInactive,
-                        { transform: [{ scale: earningPulseAnim }] },
-                      ]}
-                    />
-                    <Text
-                      style={[
-                        styles.earningStatusText,
-                        !autoYieldEnabled && styles.earningStatusTextInactive,
-                      ]}
-                    >
-                      {autoYieldEnabled
-                        ? "Your money is working"
-                        : "Auto-earn is off"}
-                    </Text>
-                  </View>
-                  <Text style={styles.earningHint}>
-                    Tap to view yield breakdown
+                  />
+                  <Text style={styles.earningStatusText}>
+                    {autoYieldEnabled
+                      ? "Your money is working"
+                      : "Auto-earn is off"}
                   </Text>
                 </View>
-              )}
-            </View>
+              </View>
+            )}
             <View style={styles.earningIconWrap}>
               <Ionicons name="trending-up" size={20} color="#A7F3C0" />
             </View>
@@ -1367,7 +1428,7 @@ export default function HomeScreen() {
                   Could not load details
                 </Text>
                 <Text style={styles.yieldErrorCopy}>
-                  {yieldError}. Check your connection and try again.
+                  {yieldError} Check your connection and try again.
                 </Text>
                 <TouchableOpacity
                   style={styles.retryButton}
@@ -1977,8 +2038,25 @@ const styles = StyleSheet.create({
     fontFamily: "Outfit_600SemiBold",
     color: COLORS.secondary,
   },
-  balanceSection: {
+  balanceSplit: {
+    flexDirection: "row",
+    gap: 10,
     marginBottom: 16,
+  },
+  balancePanel: {
+    borderRadius: 18,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    minHeight: 92,
+    justifyContent: "space-between",
+  },
+  availablePanel: {
+    flex: 1.2,
+    backgroundColor: COLORS.primary,
+  },
+  earningPanel: {
+    flex: 1,
+    backgroundColor: "#E4F7EA",
   },
   balanceLabelRow: {
     flexDirection: "row",
@@ -1986,23 +2064,35 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: 4,
   },
-  balanceLabel: {
+  availableLabel: {
     fontSize: 13,
-    fontFamily: "Outfit_400Regular",
-    color: "#777",
+    fontFamily: "Outfit_500Medium",
+    color: "#A9D8CF",
   },
-  balanceAmount: {
-    fontSize: 34,
+  availableAmount: {
+    fontSize: 24,
     fontFamily: "Outfit_700Bold",
-    color: COLORS.primary,
+    color: COLORS.secondary,
   },
   earningBalanceSection: {
+    position: "relative",
     backgroundColor: "#F2F9F0",
     borderRadius: 16,
     padding: 16,
     marginBottom: 20,
     borderWidth: 1,
     borderColor: "#E8F5E9",
+  },
+  earningBalanceGlow: {
+    ...StyleSheet.absoluteFillObject,
+    borderRadius: 18,
+    borderWidth: 2,
+    borderColor: "#34D399",
+    shadowColor: "#34D399",
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.55,
+    shadowRadius: 12,
+    elevation: 5,
   },
   earningBalanceHeader: {
     flexDirection: "row",
@@ -2020,11 +2110,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: "Outfit_500Medium",
     color: "#456047",
-  },
-  earningBalanceAmount: {
-    fontSize: 28,
-    fontFamily: "Outfit_700Bold",
-    color: "#2E7D32",
   },
   quickActions: {
     flexDirection: "row",
@@ -2342,6 +2427,11 @@ const styles = StyleSheet.create({
     color: COLORS.white,
     marginBottom: 8,
   },
+  earningHint: {
+    fontSize: 12,
+    fontFamily: "Outfit_400Regular",
+    color: "#9FD9B5",
+  },
   earningStatusRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -2383,7 +2473,7 @@ const styles = StyleSheet.create({
   earningErrorText: {
     fontSize: 14,
     fontFamily: "Outfit_600SemiBold",
-    color: "#B45309",
+    color: "#FBBF24",
     marginBottom: 6,
   },
   retryChip: {
